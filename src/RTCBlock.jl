@@ -126,7 +126,7 @@ function serve(
                         Hsm.dispatch!(sm, :Data, data.buffer)
                     catch err
                         @error "Error in loop" exception=(err, catch_backtrace())
-                        Hsm.transition!(sm, :Error)
+                        return 1
                     end
                 end
             end
@@ -197,7 +197,7 @@ function serve(
 
             catch err
                 @error "Error in loop" exception=(err, catch_backtrace())
-                Hsm.transition!(sm, :Error)
+                return 1
             end
 
         end # End while process loop
