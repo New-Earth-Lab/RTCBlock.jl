@@ -1,0 +1,8 @@
+name = "RTCBlock"
+uuid = "7cdd706b-019a-4a3b-a434-76f5582fd181"
+
+[deps]
+Aeron = "42ac8a32-990f-4d8c-aece-52d731103226"
+Hsm = "8e6e8f70-f28c-415d-b881-3282d03f8261"
+SpidersMessageEncoding = "25d647a0-ef7d-4da3-8ba8-11abaa3d526c"
+ThreadPinning = "811555cd-349b-4f26-b7bc-1f208b848042"
