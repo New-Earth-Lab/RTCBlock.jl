@@ -122,12 +122,7 @@ function serve(
             for sub in subs_data
                 bytesread, data = Aeron.poll(sub)
                 if !isnothing(data)
-                    try
-                        Hsm.dispatch!(sm, :Data, data.buffer)
-                    catch err
-                        @error "Error in loop" exception=(err, catch_backtrace())
-                        return 1
-                    end
+                    Hsm.dispatch!(sm, :Data, data.buffer)
                 end
             end
             # Now check control channel
@@ -135,69 +130,63 @@ function serve(
             if isnothing(data)
                 continue
             end
-            try
-                msg_name = SpidersMessageEncoding.sbemessagename(data.buffer)
-                
-                # TODO: we are going to simplify the commit logic 
+            msg_name = SpidersMessageEncoding.sbemessagename(data.buffer)
+            
+            # TODO: we are going to simplify the commit logic 
 
-                # A command / event to process (after the next commit is received)
-                if msg_name == :CommandMessage
-                    cmd = CommandMessage(data.buffer)
-                    # @info "Command received, queueing" cmd.command
-                    # Queue received commands back to back in a buffer.
-                    startpos = sizeof(command_message_queue)+1
-                    resize!(command_message_queue, sizeof(command_message_queue)+sizeof(cmd))
-                    command_message_queue[startpos:end] .= view(data.buffer, 1:sizeof(cmd))
-                
-                # Commit received, process all events
-                elseif msg_name == :CommitMessage
-                    # @info "Commit Received"
-                    commit_msg = CommitMessage(data.buffer)
-                    startpos = 1
-                    prevstate = Hsm.current(sm)
-                    while startpos < length(command_message_queue)
-                        # @info "processing command"
-                        cmd_data = @view command_message_queue[startpos:end]
-                        cmd = CommandMessage(cmd_data)
-                        startpos += sizeof(cmd) # Bump start position for next iteration
-                        # Check that the correlation Id matches the commit (otherwise discard)
-                        if cmd.header.correlationId != commit_msg.header.correlationId
-                            continue
-                        end
-                        
-                        cmd = CommandMessage(buffer)        
-                        event_name = Symbol(cmd.command) # TODO: make sure this is fast
-                        Hsm.dispatch!(sm, event_name, buffer)
-                        
-                        afterstate = Hsm.current(sm)
-                        # Check we haven't fallen into an error state or error sub-state
-                        if ischildof(sm, afterstate, :Error)
-                            # Republish this message to our status channel so that senders
-                            # can know we have received and dealt with their command
-                            # This is a form of *acknowledgement*
-                            Aeron.put!(aeron_status_output, cmd_data)
-                        end
-
-
-                        # If the state has changed, publish our current state. This is so listeners know
-                        # what we're doing without having to keep look at our history
-                        # of transitions.
-                        if prevstate != afterstate
-                            setargument!(status_report_msg, String(Hsm.current(sm))) # Note: this allocates on state change.
-                            status_report_msg.header.TimestampNs = 0 # TODO
-                            status_report_msg.header.correlationId = rand(Int64)
-                            Aeron.put!(aeron_status_output, status_report_buffer)
-                        end
-
+            # A command / event to process (after the next commit is received)
+            if msg_name == :CommandMessage
+                cmd = CommandMessage(data.buffer)
+                # @info "Command received, queueing" cmd.command
+                # Queue received commands back to back in a buffer.
+                startpos = sizeof(command_message_queue)+1
+                resize!(command_message_queue, sizeof(command_message_queue)+sizeof(cmd))
+                command_message_queue[startpos:end] .= view(data.buffer, 1:sizeof(cmd))
+            
+            # Commit received, process all events
+            elseif msg_name == :CommitMessage
+                # @info "Commit Received"
+                commit_msg = CommitMessage(data.buffer)
+                startpos = 1
+                prevstate = Hsm.current(sm)
+                while startpos < length(command_message_queue)
+                    # @info "processing command"
+                    cmd_data = @view command_message_queue[startpos:end]
+                    cmd = CommandMessage(cmd_data)
+                    startpos += sizeof(cmd) # Bump start position for next iteration
+                    # Check that the correlation Id matches the commit (otherwise discard)
+                    if cmd.header.correlationId != commit_msg.header.correlationId
+                        continue
                     end
-                    resize!(command_message_queue, 0)
-                else
-                    @warn "unhandled message received" maxlog=1
-                end
+                    
+                    cmd = CommandMessage(buffer)        
+                    event_name = Symbol(cmd.command) # TODO: make sure this is fast
+                    Hsm.dispatch!(sm, event_name, buffer)
+                    
+                    afterstate = Hsm.current(sm)
+                    # Check we haven't fallen into an error state or error sub-state
+                    if ischildof(sm, afterstate, :Error)
+                        # Republish this message to our status channel so that senders
+                        # can know we have received and dealt with their command
+                        # This is a form of *acknowledgement*
+                        Aeron.put!(aeron_status_output, cmd_data)
+                    end
 
-            catch err
-                @error "Error in loop" exception=(err, catch_backtrace())
-                return 1
+
+                    # If the state has changed, publish our current state. This is so listeners know
+                    # what we're doing without having to keep look at our history
+                    # of transitions.
+                    if prevstate != afterstate
+                        setargument!(status_report_msg, String(Hsm.current(sm))) # Note: this allocates on state change.
+                        status_report_msg.header.TimestampNs = 0 # TODO
+                        status_report_msg.header.correlationId = rand(Int64)
+                        Aeron.put!(aeron_status_output, status_report_buffer)
+                    end
+
+                end
+                resize!(command_message_queue, 0)
+            else
+                @warn "unhandled message received" maxlog=1
             end
 
         end # End while process loop
