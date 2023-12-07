@@ -80,7 +80,7 @@ function serve(
     status_report_msg = CommandMessage(status_report_buffer)
     status_report_msg.command = "state"
     status_report_msg.header.description = ""
-    resize!(status_report_buffer, sizeof(status_report_msg))
+    resize!(status_report_buffer, sizeof(status_report_msg)+32) # allow 32 chars of room for the status value
 
     # Keep a queue of commands to apply.
     # When commands are received, we queue them up.
@@ -89,13 +89,6 @@ function serve(
     command_message_queue = zeros(UInt8,0)
     sizehint!(command_message_queue, 2^14)
 
-    # After any command style message is received, we publish our current
-    # state out to our output status channel.
-    status_report_buffer = zeros(UInt8,1024)
-    status_report_msg = CommandMessage(status_report_buffer)
-    status_report_msg.command = "state"
-    status_report_msg.header.description = ""
-    resize!(status_report_buffer, sizeof(status_report_msg))
 
     # TODO: we could do after on initialize in the RT loop.
     run(`systemd-notify --ready`, wait=false)
@@ -103,11 +96,12 @@ function serve(
     local sub_control = nothing
     local subs_data_vec = nothing
     local pub_status = nothing
+    local subs_data
     try
         # only subscribe to the data streams *after* we have initialized
         # our block! This will reduce the frame drops when first connecting a new
         # block
-        pub_status = Aeron.subscriber(aeron, pub_status_conf)
+        pub_status = Aeron.publisher(aeron, pub_status_conf)
         sub_control = Aeron.subscriber(aeron, sub_control_conf)
         subs_data_vec = Aeron.AeronSubscription[]
         for conf in sub_data_stream_confs
@@ -159,17 +153,18 @@ function serve(
                         continue
                     end
                     
-                    cmd = CommandMessage(buffer)        
-                    event_name = Symbol(cmd.command) # TODO: make sure this is fast
-                    Hsm.dispatch!(sm, event_name, buffer)
+                    cmd = CommandMessage(cmd_data)
+                    event_name = Symbol(cmd.command)
+                    handled = Hsm.dispatch!(sm, event_name, cmd_data)
                     
                     afterstate = Hsm.current(sm)
+                    # TODO: we're still sending acknowledgements even when an event is not handled. Can we use a return value of dispatch!?
                     # Check we haven't fallen into an error state or error sub-state
-                    if ischildof(sm, afterstate, :Error)
+                    if handled && !Hsm.ischildof(sm, afterstate, :Error)
                         # Republish this message to our status channel so that senders
                         # can know we have received and dealt with their command
                         # This is a form of *acknowledgement*
-                        Aeron.put!(aeron_status_output, cmd_data)
+                        Aeron.put!(pub_status, cmd_data)
                     end
 
 
@@ -180,7 +175,8 @@ function serve(
                         setargument!(status_report_msg, String(Hsm.current(sm))) # Note: this allocates on state change.
                         status_report_msg.header.TimestampNs = 0 # TODO
                         status_report_msg.header.correlationId = rand(Int64)
-                        Aeron.put!(aeron_status_output, status_report_buffer)
+                        Aeron.put!(pub_status, status_report_buffer)
+                        # Note, we didn't shrink the status_report_buffer so it might have some hanging bytes
                     end
 
                 end
@@ -191,7 +187,6 @@ function serve(
 
         end # End while process loop
     finally
-        close(aeron)
         if !isnothing(pub_status)
             close(pub_status)
         end
@@ -199,6 +194,7 @@ function serve(
             close(sub_control)
         end
         close.(subs_data)
+        close(aeron)
     end
 end
 end
