@@ -64,6 +64,8 @@ function serve(
         i += 1
     end
 
+    GC.enable_logging()
+
     # Initialize the state machine
     Hsm.transition!(sm, :Top)
     
@@ -82,7 +84,7 @@ function serve(
     local sub_control = nothing
     local subs_data_vec = nothing
     local pub_status = nothing
-    local subs_data
+    local subs_data = nothing
     try
         # only subscribe to the data streams *after* we have initialized
         # our block! This will reduce the frame drops when first connecting a new
@@ -98,7 +100,6 @@ function serve(
         # for loop unrolls.
 
         while true
-            yield() # temp debug
             # Process any data
             for sub in subs_data
                 bytesread, data = Aeron.poll(sub)
@@ -153,7 +154,6 @@ function serve(
                         Aeron.put!(pub_status, status_report_buffer)
                         # Note, we didn't shrink the status_report_buffer so it might have some hanging bytes
                     end
-                    @show afterstate
 
                     last_ind += sizeof(event)
                 end
@@ -166,7 +166,6 @@ function serve(
             else
                 @warn "unhandled message received" maxlog=1
             end
-
         end # End while process loop
     finally
         if !isnothing(pub_status)
@@ -175,7 +174,9 @@ function serve(
         if !isnothing(sub_control)
             close(sub_control)
         end
-        close.(subs_data)
+        if !isnothing(subs_data)
+            close.(subs_data)
+        end
         close(aeron)
     end
 end
