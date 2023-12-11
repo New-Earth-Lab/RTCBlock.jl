@@ -40,9 +40,14 @@ of the state machine to any listeners if the current state has changed.
 
 Similarily, if while processing events an 
 """
-function serve(
+serve(
     sm::Hsm.AbstractStateMachine;
-    aeron = AeronContext()
+    aeron = AeronContext(),
+) = serve(Returns(nothing), sm, aeron)
+function serve(
+    sensorpoll_callback::Base.Callable,
+    sm::Hsm.AbstractStateMachine;
+    aeron = AeronContext(),
 )
 
     pub_status_conf = AeronConfig(
@@ -75,7 +80,7 @@ function serve(
     status_report_msg = EventMessage(status_report_buffer)
     status_report_msg.name = "state"
     status_report_msg.header.description = ""
-    resize!(status_report_buffer, sizeof(status_report_msg)+32) # allow 32 chars of room for the status value
+    resize!(status_report_buffer, sizeof(status_report_msg))
 
 
     # TODO: we could do after on initialize in the RT loop.
@@ -99,7 +104,15 @@ function serve(
         # TODO: need a function barrier here so that subs_data is type stable and the
         # for loop unrolls.
 
+        i = 0
         while true
+            # Make sure we don't starve another thread that has to GC
+            i += 1
+            if i == 1000
+                GC.safepoint()
+                i = 0
+            end
+
             # Process any data
             for sub in subs_data
                 bytesread, data = Aeron.poll(sub)
@@ -107,65 +120,76 @@ function serve(
                     Hsm.dispatch!(sm, :Data, data.buffer)
                 end
             end
+
             # Now check control channel
             bytesread, data = Aeron.poll(sub_control)
-            if isnothing(data)
-                continue
-            end
-            msg_name = SpidersMessageEncoding.sbemessagename(data.buffer)
-            
-            # TODO: we are going to simplify the commit logic 
+            if !isnothing(data)
+                msg_name = SpidersMessageEncoding.sbemessagename(data.buffer)
+                
+                # TODO: we are going to simplify the commit logic 
 
-            # A command / event to process (after the next commit is received)
-            if msg_name == :EventMessage
+                # A command / event to process (after the next commit is received)
+                if msg_name == :EventMessage
 
-                # We can have multiple event messages concatenated together.
-                # In this case, we apply each sequentually in one go. 
-                # This allows changing multiple parameters "atomically" between
-                # loop updates.
-                last_ind = 0
-                while last_ind < length(data.buffer) # TODO: don't fail if there are a few bytes left over
-                    data_span = @view data.buffer[last_ind+1:end]
-                    event = EventMessage(data_span, initialize=false)
-                    event_data = view(data_span, 1:sizeof(event))
-                    
-                    # Dispatch event
-                    event_name = Symbol(event.name)
-                    prevstate = Hsm.current(sm)
-                    handled = Hsm.dispatch!(sm, event_name, event_data)
-                    afterstate = Hsm.current(sm)
+                    # We can have multiple event messages concatenated together.
+                    # In this case, we apply each sequentually in one go. 
+                    # This allows changing multiple parameters "atomically" between
+                    # loop updates.
+                    last_ind = 0
+                    while last_ind < length(data.buffer) # TODO: don't fail if there are a few bytes left over
+                        data_span = @view data.buffer[last_ind+1:end]
+                        event = EventMessage(data_span, initialize=false)
+                        event_data = view(data_span, 1:sizeof(event))
+                        
+                        # Dispatch event
+                        event_name = Symbol(event.name)
+                        prevstate = Hsm.current(sm)
+                        handled = Hsm.dispatch!(sm, event_name, event_data)
+                        afterstate = Hsm.current(sm)
 
-                    # TODO: we're still sending acknowledgements even when an event is not handled. Can we use a return value of dispatch!?
-                    # Check we haven't fallen into an error state or error sub-state
-                    if handled && !Hsm.ischildof(sm, afterstate, :Error)
-                        # Republish this message to our status channel so that senders
-                        # can know we have received and dealt with their command
-                        # This is a form of *acknowledgement*
-                        Aeron.put!(pub_status, event_data)
+                        # TODO: we're still sending acknowledgements even when an event is not handled. Can we use a return value of dispatch!?
+                        # Check we haven't fallen into an error state or error sub-state
+                        if handled && !Hsm.ischildof(sm, afterstate, :Error)
+                            # Republish this message to our status channel so that senders
+                            # can know we have received and dealt with their command
+                            # This is a form of *acknowledgement*
+                            Aeron.put!(pub_status, event_data)
+                        end
+
+                        # If the state has changed, publish our current state. This is so listeners know
+                        # what we're doing without having to keep look at our history
+                        # of transitions.
+                        if prevstate != afterstate
+                            resize!(status_report_buffer, 1024) # give enough room for string
+                            setargument!(status_report_msg, String(Hsm.current(sm))) # Note: this allocates on state change.
+                            status_report_msg.header.TimestampNs = 0 # TODO
+                            status_report_msg.header.correlationId = event.header.correlationId
+                            resize!(status_report_buffer, sizeof(status_report_msg))
+                            Aeron.put!(pub_status, status_report_buffer)
+                        end
+
+                        if !handled
+                            break
+                        end
+
+                        last_ind += sizeof(event)
                     end
-
-                    # If the state has changed, publish our current state. This is so listeners know
-                    # what we're doing without having to keep look at our history
-                    # of transitions.
-                    if prevstate != afterstate
-                        setargument!(status_report_msg, String(Hsm.current(sm))) # Note: this allocates on state change.
-                        status_report_msg.header.TimestampNs = 0 # TODO
-                        status_report_msg.header.correlationId = rand(Int64)
-                        Aeron.put!(pub_status, status_report_buffer)
-                        # Note, we didn't shrink the status_report_buffer so it might have some hanging bytes
-                    end
-
-                    last_ind += sizeof(event)
+                elseif msg_name == :StatusRequestMessage
+                    msg = StatusRequestMessage(data.buffer)
+                    # get current state
+                    state_named_tuple = statevariables(sm)
+                    # TODO: loop through state and publish each message.
+                    # correlationId should match the request
+                else
+                    @warn "unhandled message received" maxlog=1
                 end
-            elseif msg_name == :StatusRequestMessage
-                msg = StatusRequestMessage(data.buffer)
-                # get current state
-                state_named_tuple = statevariables(sm)
-                # TODO: loop through state and publish each message.
-                # correlationId should match the request
-            else
-                @warn "unhandled message received" maxlog=1
             end
+
+            # User can also provide a callback for us to call in this loop
+            # periodically. This could be used to e.g. poll sensors or a 
+            # camera and then feed events
+            sensorpoll_callback()
+
         end # End while process loop
     finally
         if !isnothing(pub_status)
