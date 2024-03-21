@@ -41,12 +41,14 @@ of the state machine to any listeners if the current state has changed.
 Similarily, if while processing events an 
 """
 serve(
-    sm::Hsm.AbstractStateMachine;
+    sm::Hsm.AbstractStateMachine,
+    event_queue::Channel;
     aeron = AeronContext(),
-) = serve(Returns(nothing), sm, aeron)
+) = serve(Returns(nothing), sm, event_queue; aeron)
 function serve(
     sensorpoll_callback::Base.Callable,
-    sm::Hsm.AbstractStateMachine;
+    sm::Hsm.AbstractStateMachine,
+    event_queue::Channel;
     aeron = AeronContext(),
 )
 
@@ -76,15 +78,17 @@ function serve(
     
     # After any command style message is received, we publish our current
     # state out to our output status channel.
-    status_report_buffer = zeros(UInt8,1024)
+    status_report_buffer = zeros(UInt8,2^23) # Pre-allocate a buffer of 8Mb for the largest sized message we plan to see
     status_report_msg = EventMessage(status_report_buffer)
     status_report_msg.name = "state"
     status_report_msg.header.description = ""
-    resize!(status_report_buffer, sizeof(status_report_msg))
-
 
     # TODO: we could do after on initialize in the RT loop.
     run(`systemd-notify --ready`, wait=false)
+
+    empty_event_data = view(UInt8[],1:-1)
+
+    start_time = round(UInt64, time()*1e9)
 
     local sub_control = nothing
     local subs_data_vec = nothing
@@ -104,6 +108,9 @@ function serve(
         # TODO: need a function barrier here so that subs_data is type stable and the
         # for loop unrolls.
 
+        correlationId = 1
+        send_status_update!(pub_status, status_report_buffer, sm, correlationId)
+
         i = 0
         while true
             # Make sure we don't starve another thread that has to GC
@@ -113,11 +120,40 @@ function serve(
                 i = 0
             end
 
+            if !isempty(event_queue)
+                prevstate = Hsm.current(sm)
+                Hsm.dispatch!(sm, take!(event_queue), empty_event_data)
+                afterstate = Hsm.current(sm)
+                if prevstate != afterstate
+                    status_report_msg.name = cstatic"state"
+                    setargument!(status_report_msg, String(afterstate)) # Note: this allocates on state change.
+                    status_report_msg.header.TimestampNs = round(UInt64, time()*1e9)
+                    status_report_msg.header.correlationId = event.header.correlationId
+                    Aeron.put!(pub_status, view(status_report_buffer, 1:sizeof(status_report_msg)))
+                end
+            end
+
             # Process any data
             for sub in subs_data
-                bytesread, data = Aeron.poll(sub)
+                fragmentsread, data = Aeron.poll(sub)
                 if !isnothing(data)
-                    Hsm.dispatch!(sm, :Data, data.buffer)
+                    generic_msg = GenericMessage(data.buffer)
+                    msg_name = SpidersMessageEncoding.sbemessagename(data.buffer)
+                    if generic_msg.header.TimestampNs > start_time
+                        try
+                            Hsm.dispatch!(sm, :Data, data.buffer)
+                        catch err
+                            @error "Error in Data dispatch to state machine" exception=(err, catch_backtrace())
+                            Hsm.transition!(sm, :Error)
+                            status_report_msg.name = cstatic"state"
+                            setargument!(status_report_msg, String(Hsm.current(sm))) # Note: this allocates on state change.
+                            status_report_msg.header.TimestampNs = round(UInt64, time()*1e9)
+                            status_report_msg.header.correlationId = generic_msg.header.correlationId
+                            Aeron.put!(pub_status, view(status_report_buffer, 1:sizeof(status_report_msg)))
+                        end
+                    else
+                        @warn "Discarding stale data message"# maxlog=10
+                    end
                 end
             end
 
@@ -126,7 +162,11 @@ function serve(
             if !isnothing(data)
                 msg_name = SpidersMessageEncoding.sbemessagename(data.buffer)
                 
-                # TODO: we are going to simplify the commit logic 
+                generic_msg = GenericMessage(data.buffer)
+                if generic_msg.header.TimestampNs <= start_time
+                    @warn "Discarding stale control/event message" maxlog=10
+                    continue
+                end
 
                 # A command / event to process (after the next commit is received)
                 if msg_name == :EventMessage
@@ -139,15 +179,31 @@ function serve(
                     while last_ind < length(data.buffer) # TODO: don't fail if there are a few bytes left over
                         data_span = @view data.buffer[last_ind+1:end]
                         event = EventMessage(data_span, initialize=false)
+                        if event.name == "StatusRequest"
+                            # We handle this directly instead of in the state machine
+                            # since we have access to pub_status and they don't
+                            # In general, the state machine doesn't have to be aware
+                            # of the control and status channels
+                            send_status_update!(pub_status, status_report_buffer, sm, event.header.correlationId, )
+                            last_ind += sizeof(event)
+                            continue
+                        end
+
                         event_data = view(data_span, 1:sizeof(event))
                         
                         # Dispatch event
                         event_name = Symbol(event.name)
                         prevstate = Hsm.current(sm)
-                        handled = Hsm.dispatch!(sm, event_name, event_data)
+                        local handled
+                        try
+                            handled = Hsm.dispatch!(sm, event_name, event_data)
+                        catch err
+                            @error "Error in event dispatch to state machine" exception=(err, catch_backtrace())
+                            handled = false
+                        end
                         afterstate = Hsm.current(sm)
 
-                        # TODO: we're still sending acknowledgements even when an event is not handled. Can we use a return value of dispatch!?
+                        # TODO: we're still sending acknowledgements even when an event is not handled. Can we use a return value of dispatch!? Update: maybe this is now fixed.
                         # Check we haven't fallen into an error state or error sub-state
                         if handled && !Hsm.ischildof(sm, afterstate, :Error)
                             # Republish this message to our status channel so that senders
@@ -160,26 +216,31 @@ function serve(
                         # what we're doing without having to keep look at our history
                         # of transitions.
                         if prevstate != afterstate
-                            resize!(status_report_buffer, 1024) # give enough room for string
-                            setargument!(status_report_msg, String(Hsm.current(sm))) # Note: this allocates on state change.
-                            status_report_msg.header.TimestampNs = 0 # TODO
+                            status_report_msg.name = cstatic"state"
+                            setargument!(status_report_msg, String(afterstate)) # Note: this allocates on state change.
+                            status_report_msg.header.TimestampNs = round(UInt64, time()*1e9)
                             status_report_msg.header.correlationId = event.header.correlationId
-                            resize!(status_report_buffer, sizeof(status_report_msg))
-                            Aeron.put!(pub_status, status_report_buffer)
+                            Aeron.put!(pub_status, view(status_report_buffer, 1:sizeof(status_report_msg)))
                         end
-
                         if !handled
                             break
                         end
+                        if !isempty(event_queue)
+                            prevstate = Hsm.current(sm)
+                            Hsm.dispatch!(sm, take!(event_queue), empty_event_data)
+                            afterstate = Hsm.current(sm)
+                            if prevstate != afterstate
+                                status_report_msg.name = cstatic"state"
+                                setargument!(status_report_msg, String(afterstate)) # Note: this allocates on state change.
+                                status_report_msg.header.TimestampNs = round(UInt64, time()*1e9)
+                                status_report_msg.header.correlationId = event.header.correlationId
+                                Aeron.put!(pub_status, view(status_report_buffer, 1:sizeof(status_report_msg)))
+                            end
+                        end
 
                         last_ind += sizeof(event)
+
                     end
-                elseif msg_name == :StatusRequestMessage
-                    msg = StatusRequestMessage(data.buffer)
-                    # get current state
-                    state_named_tuple = statevariables(sm)
-                    # TODO: loop through state and publish each message.
-                    # correlationId should match the request
                 else
                     @warn "unhandled message received" maxlog=1
                 end
@@ -204,4 +265,50 @@ function serve(
         close(aeron)
     end
 end
+
+
+# Buffer used to report our current state to listners who connect late and want to catch up.
+# const status_report_buffer = zeros(UInt8,2^19)
+# const status_report_msg = EventMessage(status_report_buffer)
+# const status_report_argument_buffer = zeros(UInt8,2^17) # TODO: handle buffer reallocating and moving instead of just allocating a huge size
+
+function send_status_update!(pub_status, status_report_buffer, sm, correlationId, )
+    # Send each paramter
+    vars_nt = RTCBlock.statevariables(sm)
+    # note: statevariables() should be type stable to avoid allocations in this loop.
+    for key in keys(vars_nt)
+        val = vars_nt[key]
+        status_report_msg = EventMessage(status_report_buffer)
+        if val isa AbstractArray
+            # If the value is an array, we set the argument of the EventMessage to an appropriate ArrayMessage payload
+            # Resize message buffer down to zero argument size
+            # setargument!(status_report_msg, nothing)
+            # status_report_msg.format = SpidersMessageEncoding.ValueFormatMessage
+            # status_report_argument_buffer = view(status_report_buffer, sizeof(status_report_msg)+1:sizeof(status_report_buffer))
+            # TODO: use existing space in status_report_buffer instead of allocating here.
+            status_report_argument_buffer = zeros(UInt8, sizeof(val)+512)
+            arr_message = ArrayMessage{eltype(val),ndims(val)}(status_report_argument_buffer)
+            arraydata!(arr_message, val)
+            # Resize it down to fit
+            resize!(status_report_msg.value, sizeof(arr_message))
+            setargument!(status_report_msg, arr_message)
+        else
+            setargument!(status_report_msg, val)
+        end
+        status_report_msg.name = String(key) # allocates
+        status_report_msg.header.TimestampNs = round(UInt64, time()*1e9)
+        status_report_msg.header.correlationId = correlationId
+        Aeron.put!(pub_status,  view(status_report_buffer, 1:sizeof(status_report_msg)))
+    end
+    # Send the overall state
+    status_report_msg = EventMessage(status_report_buffer)
+    state_str = String(Hsm.current(sm)) # allocates
+    status_report_msg.name = cstatic"state"
+    setargument!(status_report_msg, state_str) # Note: this allocates.
+    status_report_msg.header.TimestampNs = round(UInt64, time()*1e9)
+    status_report_msg.header.correlationId = correlationId
+    # resize!(status_report_buffer, sizeof(status_report_msg))
+    Aeron.put!(pub_status, view(status_report_buffer, 1:sizeof(status_report_msg)))
+end
+
 end
