@@ -44,12 +44,14 @@ serve(
     sm::Hsm.AbstractStateMachine,
     event_queue::Channel;
     aeron = AeronContext(),
-) = serve(Returns(nothing), sm, event_queue; aeron)
+    ENV=ENV
+) = serve(Returns(nothing), sm, event_queue; aeron, ENV)
 function serve(
     sensorpoll_callback::Base.Callable,
     sm::Hsm.AbstractStateMachine,
     event_queue::Channel;
     aeron = AeronContext(),
+    ENV=ENV
 )
 
     pub_status_conf = AeronConfig(
@@ -62,12 +64,18 @@ function serve(
     )
     # Prepare 0 or more aeron data input streams
     sub_data_stream_confs = AeronConfig[]
+    sub_data_stream_late_data_drop_timer_s = Float64[]
     i = 1
     while haskey(ENV, "SUB_DATA_URI_$i")
         push!(sub_data_stream_confs, AeronConfig(
             uri=ENV["SUB_DATA_URI_$i"],
             stream=parse(Int, ENV["SUB_DATA_STREAM_$i"]),
         ))
+        late_data_drop_timer_s = Inf
+        if haskey(ENV, "SUB_DATA_LATE_DATA_DROP_SEC_$i")
+            late_data_drop_timer_s = parse(Float64, ENV["SUB_DATA_LATE_DATA_DROP_SEC_$i"])
+        end
+        push!(sub_data_stream_late_data_drop_timer_s, late_data_drop_timer_s)
         i += 1
     end
 
@@ -104,7 +112,7 @@ function serve(
         for conf in sub_data_stream_confs
             push!(subs_data_vec, Aeron.subscriber(aeron, conf))
         end
-        subs_data = tuple(subs_data_vec...)
+        subs_data = subs_data_vec #tuple(subs_data_vec...)
         # TODO: need a function barrier here so that subs_data is type stable and the
         # for loop unrolls.
 
@@ -112,15 +120,12 @@ function serve(
         send_status_update!(pub_status, status_report_buffer, sm, correlationId)
 
         i = 0
+        did_work_or_received_data_i=0
         while true
-            # Make sure we don't starve another thread that has to GC
             i += 1
-            if i == 1000
-                GC.safepoint()
-                i = 0
-            end
 
             if !isempty(event_queue)
+                did_work_or_received_data_i = time()
                 prevstate = Hsm.current(sm)
                 Hsm.dispatch!(sm, take!(event_queue), empty_event_data)
                 afterstate = Hsm.current(sm)
@@ -134,32 +139,51 @@ function serve(
             end
 
             # Process any data
-            for sub in subs_data
+            for (sub,late_data_drop_timer_s) in zip(subs_data, sub_data_stream_late_data_drop_timer_s)
                 fragmentsread, data = Aeron.poll(sub)
-                if !isnothing(data)
-                    generic_msg = GenericMessage(data.buffer)
-                    msg_name = SpidersMessageEncoding.sbemessagename(data.buffer)
-                    if generic_msg.header.TimestampNs > start_time
-                        try
-                            Hsm.dispatch!(sm, :Data, data.buffer)
-                        catch err
-                            @error "Error in Data dispatch to state machine" exception=(err, catch_backtrace())
-                            Hsm.transition!(sm, :Error)
-                            status_report_msg.name = cstatic"state"
-                            setargument!(status_report_msg, String(Hsm.current(sm))) # Note: this allocates on state change.
-                            status_report_msg.header.TimestampNs = round(UInt64, time()*1e9)
-                            status_report_msg.header.correlationId = generic_msg.header.correlationId
-                            Aeron.put!(pub_status, view(status_report_buffer, 1:sizeof(status_report_msg)))
-                        end
-                    else
-                        @warn "Discarding stale data message"# maxlog=10
-                    end
+                if isnothing(data)
+                    continue
+                end
+                did_work_or_received_data_i = time()
+                t_arrival_ns = round(UInt64, time()*1e9)
+                generic_msg = GenericMessage(data.buffer)
+                msg_name = SpidersMessageEncoding.sbemessagename(data.buffer)
+                # We check two timing conditions.
+                # First, any data must arrive after the service started to be considered
+                if generic_msg.header.TimestampNs < start_time
+                    @warn "Discarding stale data message (generated before the service started)"# maxlog=10
+                    continue
+                end
+                # Second, if there is a user-specified frame-drop delay, check that the arriving data is fresh enough.
+                # This prevents a single late message from cascading into many by letting us catch up.
+                # Note: clamp is to prevent any craziness if the clocks eg between computers drift or something.
+                delay = Float64(clamp(t_arrival_ns - generic_msg.header.TimestampNs, 0, typemax(Int64)))/1e9
+                if delay > late_data_drop_timer_s
+                    # TODO: would printing here actually delay us more? :(
+                    # @warn "Dropping frame!" generic_msg.header.TimestampNs t_arrival_ns late_data_drop_timer_s
+                    status_report_msg.name = cstatic"FrameDrop"
+                    setargument!(status_report_msg, delay)
+                    status_report_msg.header.TimestampNs = round(UInt64, time()*1e9)
+                    status_report_msg.header.correlationId = generic_msg.header.correlationId
+                    Aeron.put!(pub_status, view(status_report_buffer, 1:sizeof(status_report_msg)))
+                end
+                try
+                    Hsm.dispatch!(sm, :Data, data.buffer)
+                catch err
+                    @error "Error in Data dispatch to state machine" exception=(err, catch_backtrace())
+                    Hsm.transition!(sm, :Error)
+                    status_report_msg.name = cstatic"state"
+                    setargument!(status_report_msg, String(Hsm.current(sm))) # Note: this allocates on state change.
+                    status_report_msg.header.TimestampNs = round(UInt64, time()*1e9)
+                    status_report_msg.header.correlationId = generic_msg.header.correlationId
+                    Aeron.put!(pub_status, view(status_report_buffer, 1:sizeof(status_report_msg)))
                 end
             end
 
             # Now check control channel
             bytesread, data = Aeron.poll(sub_control)
             if !isnothing(data)
+                did_work_or_received_data_i = time()
                 msg_name = SpidersMessageEncoding.sbemessagename(data.buffer)
                 
                 generic_msg = GenericMessage(data.buffer)
@@ -193,6 +217,7 @@ function serve(
                         
                         # Dispatch event
                         event_name = Symbol(event.name)
+                        println(event_name)
                         prevstate = Hsm.current(sm)
                         local handled
                         try
@@ -250,6 +275,25 @@ function serve(
             # periodically. This could be used to e.g. poll sensors or a 
             # camera and then feed events
             sensorpoll_callback()
+
+            # if no work done yet, insert only a GC safepoint very occaisionally just in case there is another Julia thread
+            # waiting for GC (but there usually shouldn't be in most applications)
+            if did_work_or_received_data_i == 0
+                if mod(i, 1000) == 0
+                    GC.safepoint()
+                end
+            # If we haven't done any work in 1000 spins, sleep a moment
+            # then go back to spinning until we see data
+            elseif time() > did_work_or_received_data_i + 50e-6
+                # Make sure we don't starve another thread that has to GC
+                GC.safepoint()
+                # Definition of Libc.systemsleep:
+                # systemsleep(s::Real) = ccall(:usleep, Int32, (UInt32,), round(UInt32, s*1e6))
+                # println("sleeping", time())
+                Libc.systemsleep(100e-6)
+                did_work_or_received_data_i = 0
+            end 
+
 
         end # End while process loop
     finally
