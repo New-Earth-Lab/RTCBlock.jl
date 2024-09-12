@@ -1,5 +1,6 @@
 name = "RTCBlock"
 uuid = "7cdd706b-019a-4a3b-a434-76f5582fd181"
+version = "0.1.0"
 
 [deps]
 Aeron = "42ac8a32-990f-4d8c-aece-52d731103226"
