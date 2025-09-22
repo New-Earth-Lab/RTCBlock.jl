@@ -54,6 +54,7 @@ function serve(
     ENV=ENV
 )
 
+    pinthreads(:affinitymask)
     pub_status_conf = AeronConfig(
         uri=ENV["PUB_STATUS_URI"],
         stream=parse(Int, ENV["PUB_STATUS_STREAM"]),
@@ -282,16 +283,16 @@ function serve(
                 if mod(i, 1000) == 0
                     GC.safepoint()
                 end
-            # If we haven't done any work in 1000 spins, sleep a moment
-            # then go back to spinning until we see data
-            elseif time() > did_work_or_received_data_i + 50e-6
-                # Make sure we don't starve another thread that has to GC
-                GC.safepoint()
-                # Definition of Libc.systemsleep:
-                # systemsleep(s::Real) = ccall(:usleep, Int32, (UInt32,), round(UInt32, s*1e6))
-                # println("sleeping", time())
-                Libc.systemsleep(100e-6)
-                did_work_or_received_data_i = 0
+            # # If we haven't done any work in 1000 spins, sleep a moment
+            # # then go back to spinning until we see data
+            # elseif time() > did_work_or_received_data_i + 50e-6
+            #     # Make sure we don't starve another thread that has to GC
+            #     GC.safepoint()
+            #     # Definition of Libc.systemsleep:
+            #     # systemsleep(s::Real) = ccall(:usleep, Int32, (UInt32,), round(UInt32, s*1e6))
+            #     # println("sleeping", time())
+            #     Libc.systemsleep(100e-6)
+            #     did_work_or_received_data_i = 0
             end 
 
 
