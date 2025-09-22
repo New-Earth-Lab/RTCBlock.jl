@@ -54,7 +54,6 @@ function serve(
     ENV=ENV
 )
 
-    pinthreads(:affinitymask)
     pub_status_conf = AeronConfig(
         uri=ENV["PUB_STATUS_URI"],
         stream=parse(Int, ENV["PUB_STATUS_STREAM"]),
@@ -128,14 +127,21 @@ function serve(
             if !isempty(event_queue)
                 did_work_or_received_data_i = time()
                 prevstate = Hsm.current(sm)
-                Hsm.dispatch!(sm, take!(event_queue), empty_event_data)
-                afterstate = Hsm.current(sm)
-                if prevstate != afterstate
-                    status_report_msg.name = cstatic"state"
-                    setargument!(status_report_msg, String(afterstate)) # Note: this allocates on state change.
-                    status_report_msg.header.TimestampNs = round(UInt64, time()*1e9)
-                    status_report_msg.header.correlationId = event.header.correlationId
-                    Aeron.put!(pub_status, view(status_report_buffer, 1:sizeof(status_report_msg)))
+
+                event_name = take!(event_queue)
+
+                if event_name == :StatusRequest
+                    send_status_update!(pub_status, status_report_buffer, sm,  rand(Int64), )
+                else
+                    Hsm.dispatch!(sm, event_name, empty_event_data)
+                    afterstate = Hsm.current(sm)
+                    if prevstate != afterstate
+                        status_report_msg.name = cstatic"state"
+                        setargument!(status_report_msg, String(afterstate)) # Note: this allocates on state change.
+                        status_report_msg.header.TimestampNs = round(UInt64, time()*1e9)
+                        status_report_msg.header.correlationId = rand(Int64)
+                        Aeron.put!(pub_status, view(status_report_buffer, 1:sizeof(status_report_msg)))
+                    end
                 end
             end
 
